@@ -210,6 +210,21 @@
     padding:2px 8px;border-radius:6px;font-weight:600;
   }
 
+  .hls-status-panel{
+    display:none;margin-top:14px;padding:14px 16px;border:1px solid var(--border);
+    border-radius:12px;background:rgba(0,0,0,.25);
+  }
+  .hls-status-panel.show{display:block}
+  .hls-status-head{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+  .hls-status-head strong{font-size:.88rem}
+  .hls-status-head small{color:var(--text-dim);font-size:.72rem}
+  .hls-status-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}
+  .hls-status-item{padding:9px 11px;border-radius:8px;background:rgba(255,255,255,.035);font-size:.78rem;color:var(--text-dim)}
+  .hls-status-item b{display:block;color:var(--text);font-weight:600;margin-bottom:3px}
+  .hls-status-item.ok b{color:var(--ok)}
+  .hls-status-item.warn b{color:var(--warn)}
+  .hls-status-item.err b{color:var(--err)}
+
   /* ---------- BUTTONS ---------- */
   .btn{
     appearance:none;border:none;cursor:pointer;font-family:inherit;
@@ -799,6 +814,17 @@
         <span id="progressFps">FPS: 0</span>
       </div>
     </div>
+
+    <div class="hls-status-panel" id="hlsStatusPanel" aria-live="polite">
+      <div class="hls-status-head">
+        <strong><i class="fas fa-server"></i> Estado de archivos HLS</strong>
+        <small id="hlsStatusUpdated">Esperando información…</small>
+      </div>
+      <div class="hls-status-grid">
+        <div class="hls-status-item" id="hlsLocalStatus"><b>Servidor local</b><span>Comprobando…</span></div>
+        <div class="hls-status-item" id="hlsRemoteStatus"><b>ToDus</b><span>Comprobando…</span></div>
+      </div>
+    </div>
   </div>
 
   <!-- ============ LISTA ============ -->
@@ -903,6 +929,8 @@ let currentMediaId = null;
 let qualityLevels = [];
 let progressInterval = null;
 let currentProgressId = null;
+let hlsStatusInterval = null;
+let hlsStatusRequestId = 0;
 
 let allVideos = [];
 let filteredVideos = [];
@@ -967,6 +995,89 @@ function setStatus(state, text) {
     error: 'fa-exclamation-triangle',
   };
   el.innerHTML = `<i class="fas ${icons[state] || icons.idle}"></i> ${text}`;
+}
+
+function formatHlsBytes(bytes) {
+  const n = Number(bytes) || 0;
+  return n >= 1024 * 1024 ? `${(n / (1024 * 1024)).toFixed(1)} MB` : `${(n / 1024).toFixed(0)} KB`;
+}
+
+function renderHlsStatusItem(id, state, title, detail) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.className = `hls-status-item ${state}`;
+  el.replaceChildren();
+  const heading = document.createElement('b');
+  heading.textContent = title;
+  const text = document.createElement('span');
+  text.textContent = detail;
+  el.append(heading, text);
+}
+
+function stopHlsStatusPolling() {
+  if (hlsStatusInterval) clearInterval(hlsStatusInterval);
+  hlsStatusInterval = null;
+  hlsStatusRequestId++;
+}
+
+function startHlsStatusPolling(mediaId) {
+  stopHlsStatusPolling();
+  const panel = document.getElementById('hlsStatusPanel');
+  panel.classList.add('show');
+  pollHlsStatus(mediaId);
+  hlsStatusInterval = setInterval(() => pollHlsStatus(mediaId), 5000);
+}
+
+async function pollHlsStatus(mediaId) {
+  if (mediaId !== currentMediaId) return;
+  const requestId = hlsStatusRequestId;
+  try {
+    const response = await fetch(`${SERVER_URL}/api/media/${encodeURIComponent(mediaId)}/hls-status`, { cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    if (requestId !== hlsStatusRequestId || mediaId !== currentMediaId) return;
+
+    const local = data.local || {};
+    if (data.hls_local_borrado) {
+      renderHlsStatusItem('hlsLocalStatus', 'warn', 'Servidor local', 'Archivos locales borrados');
+    } else if (local.available) {
+      renderHlsStatusItem('hlsLocalStatus', 'ok', 'Servidor local',
+        `${local.files} archivos · ${formatHlsBytes(local.bytes)} · ${Object.entries(local.qualities || {}).filter(([,q]) => q.available).map(([q]) => q).join(', ') || 'sin calidades'}`);
+    } else {
+      renderHlsStatusItem('hlsLocalStatus', 'err', 'Servidor local', 'No se encontraron archivos HLS');
+    }
+
+    const remote = data.remote || {};
+    const job = remote.job || {};
+    const labels = {
+      available: `Disponible · ${remote.files || 0} archivos${remote.qualities_ok?.length ? ` · ${remote.qualities_ok.join(', ')}` : ''}`,
+      partial: `Incompleto · faltan: ${(remote.qualities_missing || []).join(', ') || 'archivos HLS'}`,
+      missing: 'No se encontraron archivos remotos',
+      unreachable: 'No se pudo verificar ToDus (error de conexión)',
+      not_uploaded: 'Aún no subido a ToDus',
+      uploading: 'Subiendo archivos a ToDus…',
+      checking: 'Comprobando archivos en ToDus…',
+      repairing: 'Resubiendo archivos faltantes…',
+      error: `Error al subir: ${job.message || remote.error || 'revisa el servidor'}`,
+    };
+    let remoteState = remote.status || 'not_uploaded';
+    let remoteTitle = remoteState === 'uploading' || remoteState === 'repairing'
+      ? (job.action === 'resubir' || job.action === 'repair' ? 'Resubiendo a ToDus' : 'Subiendo a ToDus')
+      : remoteState === 'checking' ? 'Verificando ToDus' : 'ToDus';
+    let remoteText = labels[remoteState] || remoteState;
+    if (['uploading', 'checking', 'repairing'].includes(job.status) && job.message) remoteText = job.message;
+    if (job.status === 'completed' && job.message) remoteText = job.message;
+    if (job.status === 'partial') remoteText = job.message || 'Reparación parcial; quedan archivos pendientes';
+    const remoteClass = remoteState === 'available' || job.status === 'completed' ? 'ok'
+      : ['partial', 'missing', 'uploading', 'checking', 'repairing'].includes(remoteState) ? 'warn'
+      : ['unreachable', 'error'].includes(remoteState) ? 'err' : '';
+    renderHlsStatusItem('hlsRemoteStatus', remoteClass, remoteTitle, remoteText);
+    document.getElementById('hlsStatusUpdated').textContent = `Actualizado ${new Date().toLocaleTimeString()}`;
+  } catch (e) {
+    if (requestId !== hlsStatusRequestId) return;
+    renderHlsStatusItem('hlsRemoteStatus', 'err', 'Estado del servidor', 'No se pudo consultar el estado HLS');
+    console.error('HLS status:', e);
+  }
 }
 
 /* NUEVO: recibe source + host */
@@ -1054,6 +1165,7 @@ async function playVideo(mediaId) {
   document.getElementById('timeDisplay').textContent = '00:00 / 00:00';
 
   currentMediaId = mediaId;
+  startHlsStatusPolling(mediaId);
   document.getElementById('qualitySelector').querySelectorAll('.quality-badge:not(.auto)').forEach(b => b.remove());
   infoPanel.style.display = 'none';
   progressPanel.classList.remove('show'); // Ocultar el panel de progreso incrustado antiguo
@@ -1723,6 +1835,8 @@ async function deleteVideo(mediaId, source = 'all') {
         setSourceBadge(null);
         currentMediaId = null;
         stopProgressPolling();
+        stopHlsStatusPolling();
+        document.getElementById('hlsStatusPanel').classList.remove('show');
       }
     }
 
