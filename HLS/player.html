@@ -149,6 +149,8 @@
     border-color:#43e97b;background:rgba(67,233,123,.2);
   }
   .quality-badge .bitrate{font-size:.62rem;opacity:.7}
+  .quality-selector .btn{margin-left:auto}
+  @media(max-width:640px){.quality-selector .btn{margin-left:0}}
 
   /* ---------- INFO PANEL ---------- */
   .info-panel{
@@ -764,6 +766,9 @@
       <span class="quality-badge auto active" data-level="-1" onclick="switchQuality(-1)">
         <i class="fas fa-magic"></i> Auto
       </span>
+      <button class="btn btn-ghost btn-sm" id="resubirCalidadBtn" onclick="resubirCalidadActual()" disabled title="Selecciona o espera una calidad activa">
+        <i class="fas fa-cloud-upload-alt"></i> Resubir calidad a ToDus
+      </button>
     </div>
 
     <!-- Info del video (Bitrate, Resolución, etc) -->
@@ -926,7 +931,10 @@ const SERVER_URL = window.location.origin;
 const uploadingSet = new Set(); // media_id en proceso de subida a ToDus
 let hls = null;
 let currentMediaId = null;
+let currentMediaHasTodus = false;
+let activeQualityLevel = -1;
 let qualityLevels = [];
+let qualityUploadInProgress = false;
 let progressInterval = null;
 let currentProgressId = null;
 let hlsStatusInterval = null;
@@ -1165,6 +1173,9 @@ async function playVideo(mediaId) {
   document.getElementById('timeDisplay').textContent = '00:00 / 00:00';
 
   currentMediaId = mediaId;
+  currentMediaHasTodus = !!earlyStatus.en_todus;
+  activeQualityLevel = -1;
+  updateResubirCalidadButton();
   startHlsStatusPolling(mediaId);
   document.getElementById('qualitySelector').querySelectorAll('.quality-badge:not(.auto)').forEach(b => b.remove());
   infoPanel.style.display = 'none';
@@ -1232,6 +1243,8 @@ function loadHls(url, video) {
     });
 
     hls.on(Hls.Events.LEVEL_SWITCHED, (event, data) => {
+      activeQualityLevel = data.level;
+      updateResubirCalidadButton();
       const level = hls.levels[data.level];
       if (level) {
         document.getElementById('bitrateInfo').textContent = `${Math.round(level.bitrate / 1000)} Kbps`;
@@ -1284,15 +1297,88 @@ function buildQualitySelector(levels) {
   });
 }
 
+function updateResubirCalidadButton() {
+  const button = document.getElementById('resubirCalidadBtn');
+  if (!button) return;
+  const hasLevel = activeQualityLevel >= 0 && activeQualityLevel < qualityLevels.length;
+  button.disabled = !currentMediaId || !currentMediaHasTodus || !hasLevel || qualityUploadInProgress;
+  button.title = !currentMediaId ? 'Reproduce un video primero'
+    : !currentMediaHasTodus ? 'Este video todavía no está subido a ToDus'
+    : !hasLevel ? 'Espera a que el reproductor detecte la calidad activa'
+    : qualityUploadInProgress ? 'Resubida en curso'
+    : `Resubir solo ${qualityLevels[activeQualityLevel].height}p a ToDus`;
+}
+
+async function resubirCalidadActual() {
+  if (!currentMediaId || !currentMediaHasTodus || qualityUploadInProgress
+      || activeQualityLevel < 0 || !qualityLevels[activeQualityLevel]) return;
+
+  const mediaId = currentMediaId;
+  const level = qualityLevels[activeQualityLevel];
+  const quality = `${level.height}p`;
+  const video = document.getElementById('video');
+  const playbackTime = video.currentTime;
+  const wasPlaying = !video.paused && !video.ended;
+  const button = document.getElementById('resubirCalidadBtn');
+
+  qualityUploadInProgress = true;
+  updateResubirCalidadButton();
+  button.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Resubiendo…';
+  renderHlsStatusItem('hlsRemoteStatus', 'warn', `Resubiendo ${quality}`, 'Preparando archivos…');
+
+  try {
+    const response = await fetch(
+      `${SERVER_URL}/api/todus/upload/${encodeURIComponent(mediaId)}/${encodeURIComponent(quality)}`,
+      { method: 'POST' }
+    );
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`);
+    if (mediaId !== currentMediaId) return;
+
+    // Si seguimos reproduciendo esta misma calidad, invalidamos su playlist
+    // para volver a consultarla. No pausamos ni destruimos hls.js: el buffer
+    // actual continúa mientras llegan los siguientes segmentos.
+    const playingLevel = hls && hls.levels[activeQualityLevel];
+    if (playingLevel && playingLevel.height === level.height) {
+      const urls = Array.isArray(playingLevel.url) ? playingLevel.url.slice() : [playingLevel.url];
+      const refreshToken = Date.now();
+      const refreshedUrls = urls.map(url => {
+        const playlistUrl = new URL(url, window.location.href);
+        playlistUrl.searchParams.set('refresh', refreshToken);
+        return playlistUrl.toString();
+      });
+      playingLevel.url = Array.isArray(playingLevel.url) ? refreshedUrls : refreshedUrls[0];
+      playingLevel.details = null;
+      hls.stopLoad();
+      hls.startLoad(video.currentTime);
+      if (wasPlaying) video.play().catch(() => {});
+    }
+    showToast(`✅ Calidad ${quality} resubida; la reproducción continúa`, 'success');
+    pollHlsStatus(mediaId);
+  } catch (e) {
+    console.error('Resubir calidad:', e);
+    showToast(`❌ No se pudo resubir ${quality}: ${e.message}`, 'error');
+    renderHlsStatusItem('hlsRemoteStatus', 'err', `Error en ${quality}`, e.message);
+  } finally {
+    qualityUploadInProgress = false;
+    button.innerHTML = '<i class="fas fa-cloud-upload-alt"></i> Resubir calidad a ToDus';
+    updateResubirCalidadButton();
+  }
+}
+
 function switchQuality(levelIndex) {
   if (!hls) return;
   if (levelIndex === -1) {
     hls.currentLevel = -1;
+    activeQualityLevel = -1;
+    updateResubirCalidadButton();
     document.getElementById('bitrateInfo').textContent = 'Adaptativo';
     updateQualityActive(-1);
     showToast('Calidad automática', 'info');
   } else if (levelIndex >= 0 && levelIndex < qualityLevels.length) {
     hls.currentLevel = levelIndex;
+    activeQualityLevel = levelIndex;
+    updateResubirCalidadButton();
     const lvl = qualityLevels[levelIndex];
     document.getElementById('bitrateInfo').textContent = `${Math.round(lvl.bitrate / 1000)} Kbps`;
     updateQualityActive(levelIndex);
