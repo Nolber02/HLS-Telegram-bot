@@ -836,7 +836,7 @@
         <span class="count-badge" id="videoCount" style="background:rgba(79,172,254,.15);color:#4facfe;padding:2px 10px;border-radius:12px;font-size:.75rem;font-weight:700">0</span>
       </h2>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <button class="btn btn-ghost btn-sm" onclick="loadList(true)">
+        <button class="btn btn-ghost btn-sm" id="refreshListBtn" onclick="refreshListSoft()">
           <i class="fas fa-sync"></i> Actualizar
         </button>
       </div>
@@ -1410,7 +1410,7 @@ async function pollProgress(mediaId) {
    ============================================================ */
 async function loadList(showLoading = false) {
   const listEl = document.getElementById('videoList');
-  if (showLoading) {
+  if (showLoading && allVideos.length === 0) {
     listEl.innerHTML = `
       <div class="skeleton"><div class="bar"></div><div class="bar small"></div></div>
       <div class="skeleton"><div class="bar"></div><div class="bar small"></div></div>
@@ -1442,8 +1442,15 @@ async function loadList(showLoading = false) {
 }
 
 async function refreshListSoft() {
+  const button = document.getElementById('refreshListBtn');
+  const icon = button?.querySelector('i');
+  if (button?.disabled) return;
+  if (button) button.disabled = true;
+  if (icon) icon.classList.add('fa-spin');
   try {
-    const data = await fetch(`${SERVER_URL}/list?limit=500`).then(r => r.json());
+    const response = await fetch(`${SERVER_URL}/list?limit=500`, { cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
     if (!data || !Array.isArray(data.media)) return;
     allVideos = data.media;
     document.getElementById('totalCount').textContent = allVideos.length;
@@ -1451,12 +1458,16 @@ async function refreshListSoft() {
     applyFilters();
   } catch (e) {
     console.error('refreshListSoft:', e);
+    showToast('No se pudo actualizar la lista', 'error');
+  } finally {
+    if (button) button.disabled = false;
+    if (icon) icon.classList.remove('fa-spin');
   }
 }
 
 function listsIguales(a, b) {
   if (a.length !== b.length) return false;
-  const key = v => `${v._ui_id}|${v.status}|${v.en_todus}|${v.hls_local_borrado}|${v.mp4_ready}`;
+  const key = v => `${v._ui_id}|${v.status}|${v.en_todus}|${v.hls_local_borrado}|${v.mp4_ready}|${v.display_name}|${v.description}|${(v.qualities || []).join(',')}|${JSON.stringify(v.quality_sizes || {})}|${JSON.stringify(v.mp4_available || {})}`;
   const sa = a.map(key).sort().join('|');
   const sb = b.map(key).sort().join('|');
   return sa === sb;
