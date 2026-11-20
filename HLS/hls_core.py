@@ -759,7 +759,7 @@ def generar_mp4_desde_hls(media_id: str, internal_id: str, quality: str,
 # ─────────────────────────────────────────────────────────────
 # SUBIR HLS A TODUS
 # ─────────────────────────────────────────────────────────────
-def subir_hls_a_todus(media_id: str, display_name: str) -> dict:
+def subir_hls_a_todus(media_id: str, display_name: str, progress_callback=None) -> dict:
     todus = get_todus()
     media = read_db_one(media_id)
     if not media:
@@ -780,8 +780,19 @@ def subir_hls_a_todus(media_id: str, display_name: str) -> dict:
 
     subidos = 0
     errores = []
+    total_archivos = sum(
+        int((local_root / q / "playlist.m3u8").is_file())
+        + len(list((local_root / q).glob("*.ts")))
+        for q in media.get("qualities", []) if (local_root / q).is_dir()
+    ) + 1  # master.m3u8
+    procesados = 0
+    update_video(media_id, todus_upload_progress={
+        "status": "uploading", "action": "upload", "done": 0,
+        "total": total_archivos, "updated_at": datetime.utcnow().isoformat(),
+    })
 
     def _subir(local: Path, path_rel: str, name: str):
+        nonlocal procesados
         nonlocal subidos
         try:
             res = todus.upload_to_user(
@@ -797,6 +808,18 @@ def subir_hls_a_todus(media_id: str, display_name: str) -> dict:
                 errores.append(f"{name}: {res.error}")
         except Exception as e:
             errores.append(f"{name}: {e}")
+        finally:
+            procesados += 1
+            update_video(media_id, todus_upload_progress={
+                "status": "uploading", "action": "upload", "done": procesados,
+                "total": total_archivos, "filename": name,
+                "updated_at": datetime.utcnow().isoformat(),
+            })
+            if progress_callback:
+                try:
+                    progress_callback(procesados, total_archivos, name)
+                except Exception:
+                    pass
 
     qualities_ok = []
     for q in media.get("qualities", []):
@@ -817,6 +840,7 @@ def subir_hls_a_todus(media_id: str, display_name: str) -> dict:
             qualities_ok.append(q)
 
     if not qualities_ok:
+        _clear_field(media_id, "todus_upload_progress")
         print(f"[TODUS-HLS] ❌ {media_id}: no se subió ninguna calidad")
         return {}
 
@@ -843,6 +867,7 @@ def subir_hls_a_todus(media_id: str, display_name: str) -> dict:
         except Exception:
             pass
 
+    _clear_field(media_id, "todus_upload_progress")
     if errores:
         print(f"[TODUS-HLS] ⚠️ {media_id}: {len(errores)} errores (primeros 3): {errores[:3]}")
     print(f"[TODUS-HLS] ✅ {media_id} [{active_host}]: "
@@ -1020,7 +1045,7 @@ def verificar_todus_video(media: dict) -> dict:
     return result
 
 
-def reparar_hls_todus(media_id: str) -> dict:
+def reparar_hls_todus(media_id: str, progress_callback=None) -> dict:
     """Sube a ToDus los archivos HLS locales que falten, conservando su carpeta y host."""
     media = read_db_one(media_id)
     if not media or media.get("status") != "completed":
@@ -1032,7 +1057,7 @@ def reparar_hls_todus(media_id: str) -> dict:
     display_name = (media.get("display_name")
                     or media.get("original_filename") or media_id)
     if not info.get("carpeta_video"):
-        info = subir_hls_a_todus(media_id, display_name)
+        info = subir_hls_a_todus(media_id, display_name, progress_callback)
         if not info:
             return {"estado": "error", "error": "No se pudo subir el HLS a ToDus"}
         update_video(media_id, todus_hls=info, hls_source="todus")
@@ -1056,8 +1081,21 @@ def reparar_hls_todus(media_id: str) -> dict:
     subidos = 0
     errores = []
     calidades_ok = []
+    master_key = f"{prefix}master.m3u8"
+    total_archivos = int(master_key not in keys) + sum(
+        1 for quality in media.get("qualities", [])
+        if (local_root / quality).is_dir()
+        for local_file in (
+            ([local_root / quality / "playlist.m3u8"]
+             if (local_root / quality / "playlist.m3u8").is_file() else [])
+            + sorted((local_root / quality).glob("*.ts"))
+        )
+        if f"{prefix}{carpeta}_{quality}/{local_file.name}" not in keys
+    )
+    procesados = 0
 
     def subir_archivo(local_path: Path, path: str, filename: str):
+        nonlocal procesados
         nonlocal subidos
         try:
             resultado = todus.upload_to_user(
@@ -1071,8 +1109,19 @@ def reparar_hls_todus(media_id: str) -> dict:
                 errores.append(f"{filename}: {resultado.error or 'error de subida'}")
         except Exception as e:
             errores.append(f"{filename}: {e}")
+        finally:
+            procesados += 1
+            if progress_callback:
+                try:
+                    progress_callback(procesados, total_archivos, filename)
+                except Exception:
+                    pass
+            update_video(media_id, todus_upload_progress={
+                "status": "repairing", "action": "repair",
+                "done": procesados, "total": total_archivos,
+                "filename": filename, "updated_at": datetime.utcnow().isoformat(),
+            })
 
-    master_key = f"{prefix}master.m3u8"
     if master_key not in keys:
         media_para_master = dict(media)
         media_para_master["todus_hls"] = {
@@ -1131,6 +1180,7 @@ def reparar_hls_todus(media_id: str) -> dict:
 
     if subidos:
         update_video(media_id, todus_hls=info, hls_source="todus")
+    _clear_field(media_id, "todus_upload_progress")
 
     master_ok = master_key in keys
     if master_ok and len(calidades_ok) == len(media.get("qualities", [])):
