@@ -883,6 +883,97 @@ def subir_hls_a_todus(media_id: str, display_name: str, progress_callback=None) 
         "host": active_host,
     }
 
+def resubir_calidad_hls_a_todus(media_id: str, quality: str, progress_callback=None) -> dict:
+    """Reemplaza en ToDus solo la playlist y los segmentos de una calidad HLS."""
+    todus = get_todus()
+    media = read_db_one(media_id)
+    if not media or media.get("status") != "completed":
+        raise ValueError("Video no disponible o no completado")
+    if quality not in media.get("qualities", []):
+        raise ValueError(f"Calidad no disponible: {quality}")
+    if media.get("hls_local_borrado"):
+        raise ValueError("HLS local borrado: no se puede resubir esta calidad")
+
+    info = media.get("todus_hls") or {}
+    carpeta = info.get("carpeta_video")
+    if not carpeta:
+        raise ValueError("El video todavía no tiene una carpeta HLS en ToDus")
+
+    host = info.get("host") or todus.default_host
+    internal_id = media.get("internal_id")
+    quality_dir = MEDIA_DIR / (internal_id or "") / quality
+    playlist = quality_dir / "playlist.m3u8"
+    segments = sorted(quality_dir.glob("*.ts")) if quality_dir.is_dir() else []
+    if not playlist.is_file() or not segments:
+        raise ValueError(f"No se encontraron playlist y segmentos locales para {quality}")
+
+    remote_path = f"{carpeta}/{carpeta}_{quality}"
+    total = len(segments) + 1
+    _clear_field(media_id, "todus_upload_progress")
+
+    refresh_token = str(int(time.time() * 1000))
+
+    def upload(local_path: Path, filename: str, done: int):
+        result = todus.upload_to_user(
+            owner_id=0, uploader_id=0, local_path=str(local_path),
+            path=remote_path, original_name=filename, host=host,
+        )
+        if not result.success:
+            raise RuntimeError(f"{filename}: {result.error or 'falló la subida'}")
+        progress = {
+            "status": "uploading", "action": "resubir_calidad",
+            "quality": quality, "done": done, "total": total,
+            "filename": filename, "updated_at": datetime.utcnow().isoformat(),
+        }
+        update_video(media_id, todus_upload_progress=progress)
+        if progress_callback:
+            progress_callback(done, total, filename)
+
+    update_video(media_id, todus_upload_progress={
+        "status": "uploading", "action": "resubir_calidad",
+        "quality": quality, "done": 0, "total": total,
+        "updated_at": datetime.utcnow().isoformat(),
+    })
+    try:
+        # Primero segmentos y al final playlist, para no publicar una playlist
+        # nueva antes de que sus segmentos hayan terminado de subirse.
+        for index, segment in enumerate(segments, start=1):
+            upload(segment, segment.name, index)
+
+        # Cache-busting en las URI de segmentos de la playlist remota para
+        # que el player reciba los segmentos recién resubidos y no una copia
+        # anterior servida desde caché.
+        playlist_lines = []
+        for line in playlist.read_text(encoding="utf-8").splitlines():
+            uri = line.strip()
+            if uri and not uri.startswith("#"):
+                parts = urllib.parse.urlsplit(uri)
+                query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+                query = [(key, value) for key, value in query if key != "refresh"]
+                query.append(("refresh", refresh_token))
+                uri = urllib.parse.urlunsplit((
+                    parts.scheme, parts.netloc, parts.path,
+                    urllib.parse.urlencode(query), parts.fragment,
+                ))
+            playlist_lines.append(uri)
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", suffix=".m3u8", delete=False,
+        ) as temp_playlist:
+            temp_playlist.write("\n".join(playlist_lines) + "\n")
+            temp_playlist_path = Path(temp_playlist.name)
+        try:
+            upload(temp_playlist_path, playlist.name, total)
+        finally:
+            temp_playlist_path.unlink(missing_ok=True)
+    except Exception:
+        _clear_field(media_id, "todus_upload_progress")
+        raise
+
+    _clear_field(media_id, "todus_upload_progress")
+    return {"quality": quality, "host": host, "files_uploaded": total}
+
+
 # ─────────────────────────────────────────────────────────────
 # BORRAR HLS DE TODUS
 # ─────────────────────────────────────────────────────────────
