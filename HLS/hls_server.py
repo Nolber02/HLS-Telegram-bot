@@ -45,6 +45,7 @@ from hls_core import (
     read_db_one, update_video, delete_video_db, list_videos, count_by_status,
     generar_mp4_desde_hls, subir_hls_a_todus, borrar_hls_de_todus,
     build_master_text, get_todus, reparar_hls_todus, verificar_todus_video,
+    resubir_calidad_hls_a_todus,
 )
 
 _TODUS_REPAIR_LOCK = asyncio.Lock()
@@ -76,6 +77,9 @@ async def _vigilar_hls_todus():
                     for media_id, media in videos:
                         if (media.get("status") != "completed"
                                 or media.get("hls_local_borrado")):
+                            continue
+                        active_job = _get_todus_job(media_id)
+                        if active_job.get("status") in ("uploading", "checking", "repairing"):
                             continue
                         local_root = MEDIA_DIR / media.get("internal_id", "")
                         if not local_root.is_dir():
@@ -912,6 +916,55 @@ async def subir_a_todus_endpoint(media_id: str, request: Request):
     except Exception as e:
         _set_todus_job(media_id, status="error", message="Error durante la subida", error=str(e))
         raise HTTPException(500, str(e))
+
+@app.post("/api/todus/upload/{media_id}/{quality}")
+async def resubir_calidad_a_todus(media_id: str, quality: str):
+    media = await _run_blocking(read_db_one, media_id)
+    if not media or media.get("status") != "completed":
+        raise HTTPException(404, "Media not found or not completed")
+    if quality not in media.get("qualities", []):
+        raise HTTPException(404, "Quality not found")
+    if not media.get("todus_hls"):
+        raise HTTPException(409, "Este video todavía no está subido a ToDus")
+    if media.get("hls_local_borrado"):
+        raise HTTPException(409, "HLS local borrado: no se puede resubir")
+
+    current_job = _get_todus_job(media_id)
+    if current_job.get("status") in ("uploading", "checking", "repairing"):
+        raise HTTPException(409, "Ya hay una subida o reparación en curso para este video")
+
+    _TODUS_STATUS_CACHE.pop(media_id, None)
+    _set_todus_job(
+        media_id, status="uploading", action="resubir_calidad", quality=quality,
+        message=f"Preparando resubida de {quality}", archivos_subidos=0,
+    )
+
+    def _progress(done, total, filename):
+        _set_todus_job(
+            media_id, status="uploading", action="resubir_calidad", quality=quality,
+            message=f"Resubiendo {quality}: archivo {done}/{total} ({filename})",
+            archivos_subidos=done, archivos_total=total,
+        )
+
+    try:
+        result = await _run_blocking(
+            resubir_calidad_hls_a_todus, media_id, quality, _progress,
+        )
+        await _run_blocking(update_video, media_id, hls_source="todus")
+        _TODUS_STATUS_CACHE.pop(media_id, None)
+        _set_todus_job(
+            media_id, status="completed", action="resubir_calidad", quality=quality,
+            message=f"Calidad {quality} resubida ({result['files_uploaded']} archivos)",
+            archivos_subidos=result["files_uploaded"], archivos_total=result["files_uploaded"],
+        )
+        return {"status": "ok", **result}
+    except Exception as e:
+        _set_todus_job(
+            media_id, status="error", action="resubir_calidad", quality=quality,
+            message=f"Error resubiendo {quality}", error=str(e),
+        )
+        raise HTTPException(409 if isinstance(e, ValueError) else 500, str(e))
+
 
 @app.delete("/api/todus/{media_id}")
 async def borrar_de_todus(media_id: str):
