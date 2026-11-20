@@ -26,6 +26,7 @@ Endpoints:
 import asyncio
 import os
 import shutil
+import threading
 import urllib.parse
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -43,10 +44,26 @@ from hls_core import (
     COMPRESSION_PROFILES, BASE_QUALITIES, RUNTIME,
     read_db_one, update_video, delete_video_db, list_videos, count_by_status,
     generar_mp4_desde_hls, subir_hls_a_todus, borrar_hls_de_todus,
-    build_master_text, get_todus, reparar_hls_todus,
+    build_master_text, get_todus, reparar_hls_todus, verificar_todus_video,
 )
 
 _TODUS_REPAIR_LOCK = asyncio.Lock()
+_TODUS_JOBS_LOCK = threading.Lock()
+_TODUS_JOBS = {}
+_TODUS_STATUS_CACHE = {}
+
+
+def _set_todus_job(media_id: str, **fields):
+    with _TODUS_JOBS_LOCK:
+        job = dict(_TODUS_JOBS.get(media_id) or {})
+        job.update(fields)
+        job["updated_at"] = datetime.utcnow().isoformat()
+        _TODUS_JOBS[media_id] = job
+
+
+def _get_todus_job(media_id: str):
+    with _TODUS_JOBS_LOCK:
+        return dict(_TODUS_JOBS.get(media_id) or {})
 
 
 async def _vigilar_hls_todus():
@@ -63,14 +80,41 @@ async def _vigilar_hls_todus():
                         local_root = MEDIA_DIR / media.get("internal_id", "")
                         if not local_root.is_dir():
                             continue
-                        resultado = await _run_blocking(reparar_hls_todus, media_id)
-                        if resultado.get("archivos_subidos"):
+                        _set_todus_job(media_id, status="checking", action="repair", message="Comprobando archivos remotos")
+
+                        def _repair_progress(done, total, filename):
+                            _set_todus_job(
+                                media_id, status="repairing", action="repair",
+                                message=f"Resubiendo archivo {done}/{total}: {filename}",
+                                archivos_subidos=done, archivos_total=total,
+                            )
+
+                        resultado = await _run_blocking(reparar_hls_todus, media_id, _repair_progress)
+                        if resultado.get("estado") in ("error", "parcial"):
+                            _set_todus_job(
+                                media_id, status="error" if resultado.get("estado") == "error" else "partial",
+                                action="repair", message="Reparación con archivos pendientes",
+                                error=resultado.get("errores", resultado.get("error")),
+                            )
+                            print(f"[TODUS-WATCH] {media_id}: {resultado}")
+                        elif resultado.get("archivos_subidos"):
+                            _TODUS_STATUS_CACHE.pop(media_id, None)
+                            _set_todus_job(
+                                media_id, status="completed", action="repair",
+                                message=f"Reparación completada: {resultado['archivos_subidos']} archivo(s) subidos",
+                                archivos_subidos=resultado["archivos_subidos"],
+                            )
                             print(
                                 f"[TODUS-WATCH] {media_id}: "
                                 f"{resultado['archivos_subidos']} archivo(s) reparados"
                             )
-                        if resultado.get("estado") in ("error", "parcial"):
-                            print(f"[TODUS-WATCH] {media_id}: {resultado}")
+                        else:
+                            _TODUS_STATUS_CACHE.pop(media_id, None)
+                            _set_todus_job(
+                                media_id, status="idle", action=None,
+                                message="Revisión automática completada",
+                                archivos_subidos=0,
+                            )
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -287,6 +331,73 @@ async def get_status(media_id: str):
         response["error"] = media.get("error", "Unknown error")
 
     return response
+
+
+@app.get("/api/media/{media_id}/hls-status")
+async def get_hls_status(media_id: str):
+    media = await _run_blocking(read_db_one, media_id)
+    if not media:
+        raise HTTPException(404, "Media not found")
+
+    qualities = media.get("qualities", [])
+    local_root = MEDIA_DIR / (media.get("internal_id") or "")
+    local = {"available": False, "files": 0, "bytes": 0, "qualities": {}}
+    if not media.get("hls_local_borrado") and local_root.is_dir():
+        for quality in qualities:
+            quality_dir = local_root / quality
+            files = list(quality_dir.glob("*.ts")) if quality_dir.is_dir() else []
+            playlist = quality_dir / "playlist.m3u8"
+            count = len(files) + int(playlist.is_file())
+            size = sum(f.stat().st_size for f in files if f.is_file())
+            if playlist.is_file():
+                size += playlist.stat().st_size
+            local["qualities"][quality] = {"available": count > 0, "files": count, "bytes": size}
+            local["files"] += count
+            local["bytes"] += size
+        local["available"] = local["files"] > 0 or (local_root / "master.m3u8").is_file()
+        if (local_root / "master.m3u8").is_file():
+            local["files"] += 1
+            local["bytes"] += (local_root / "master.m3u8").stat().st_size
+
+    job = _get_todus_job(media_id) or media.get("todus_upload_progress") or {}
+    remote = {"status": "not_uploaded", "available": False, "verified": False,
+              "files": 0, "qualities_ok": [], "qualities_missing": []}
+    if job.get("status") in ("uploading", "checking", "repairing"):
+        remote.update(status=job["status"], message=job.get("message"))
+    elif media.get("todus_hls"):
+        cached = _TODUS_STATUS_CACHE.get(media_id)
+        if cached and (datetime.utcnow() - cached["at"]).total_seconds() < 15:
+            verification = cached["data"]
+        else:
+            verification = await _run_blocking(verificar_todus_video, media)
+            _TODUS_STATUS_CACHE[media_id] = {"at": datetime.utcnow(), "data": verification}
+        state = verification.get("estado", "error")
+        remote.update(
+            status={"ok": "available", "parcial": "partial", "ausente": "missing",
+                    "error": "unreachable", "sin_info": "missing"}.get(state, state),
+            available=state == "ok",
+            verified=state != "error",
+            files=verification.get("archivos_bucket", 0),
+            master_exists=verification.get("master_existe", False),
+            qualities_ok=verification.get("calidades_ok", []),
+            qualities_missing=verification.get("calidades_faltantes", []),
+            error=verification.get("error"),
+        )
+    if job:
+        remote["job"] = job
+        if job.get("status") in ("uploading", "checking", "repairing"):
+            remote["status"] = job["status"]
+            remote["message"] = job.get("message") or (
+                f"{job.get('done', 0)}/{job.get('total', 0)} archivos procesados"
+            )
+    return {
+        "media_id": media_id,
+        "status": media.get("status"),
+        "local": local,
+        "remote": remote,
+        "hls_local_borrado": bool(media.get("hls_local_borrado")),
+        "checked_at": datetime.utcnow().isoformat(),
+    }
 
 
 @app.get("/progress/{media_id}")
@@ -772,11 +883,35 @@ async def subir_a_todus_endpoint(media_id: str, request: Request):
     display = (media.get("display_name")
                or Path(media.get("original_filename", media_id)).stem)
 
-    info = await _run_blocking(subir_hls_a_todus, media_id, display)
-    if not info:
-        raise HTTPException(500, "No se pudo subir a ToDus (revisa la consola)")
-    await _run_blocking(update_video, media_id, todus_hls=info, hls_source="todus", hls_local_borrado=False)
-    return {"status": "ok", "todus_hls": info}
+    _set_todus_job(
+        media_id, status="uploading", action="upload" if not force else "resubir",
+        message="Subiendo archivos a ToDus", archivos_subidos=0,
+    )
+    def _upload_progress(done, total, filename):
+        _set_todus_job(
+            media_id, status="uploading", action="upload" if not force else "resubir",
+            message=f"Subiendo archivo {done}/{total}: {filename}",
+            archivos_subidos=done, archivos_total=total,
+        )
+
+    try:
+        info = await _run_blocking(subir_hls_a_todus, media_id, display, _upload_progress)
+        if not info:
+            _set_todus_job(media_id, status="error", message="No se pudo subir a ToDus")
+            raise HTTPException(500, "No se pudo subir a ToDus (revisa la consola)")
+        await _run_blocking(update_video, media_id, todus_hls=info, hls_source="todus", hls_local_borrado=False)
+        _TODUS_STATUS_CACHE.pop(media_id, None)
+        _set_todus_job(
+            media_id, status="completed",
+            message="Resubida completada" if force else "Subida completada",
+            archivos_subidos=info.get("archivos_subidos", 0), action="resubir" if force else "upload",
+        )
+        return {"status": "ok", "todus_hls": info}
+    except HTTPException:
+        raise
+    except Exception as e:
+        _set_todus_job(media_id, status="error", message="Error durante la subida", error=str(e))
+        raise HTTPException(500, str(e))
 
 @app.delete("/api/todus/{media_id}")
 async def borrar_de_todus(media_id: str):
@@ -788,6 +923,9 @@ async def borrar_de_todus(media_id: str):
 
     borrados = await _run_blocking(borrar_hls_de_todus, media)
     await _run_blocking(update_video, media_id, todus_hls=None, hls_source="local")
+    _TODUS_STATUS_CACHE.pop(media_id, None)
+    with _TODUS_JOBS_LOCK:
+        _TODUS_JOBS.pop(media_id, None)
     return {"status": "ok", "borrados": borrados}
 
 # ─────────────────────────────────────────────────────────────
